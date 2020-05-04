@@ -68,10 +68,10 @@ func Worker(targets <-chan string, external chan<- string) {
 func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	c := colly.NewCollector(
-		colly.Async(true),
+		//colly.Async(true),
 		colly.MaxDepth(3),
 	)
-	c.Limit(&colly.LimitRule{Parallelism: 10})
+	//c.Limit(&colly.LimitRule{Parallelism: 300})
 	extensions.RandomUserAgent(c)
 	extensions.Referer(c)
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
@@ -89,7 +89,7 @@ func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 
 	})
 	c.Visit(target)
-	c.Wait()
+	//c.Wait()
 }
 
 func StartParsing() {
@@ -104,9 +104,9 @@ func StartParsing() {
 	}
 	//db.LogMode(true)
 	defer db.Close()
-	targets := make(chan string, 10000)
+	targets := make(chan string, 1000)
 	external := make(chan string, 10000)
-	for i := 0; i < 10; i++ {
+	for i := 0; i < 100; i++ {
 		go Worker(targets, external)
 	}
 	if len(targets) < 100 {
@@ -131,7 +131,7 @@ func StartParsing() {
 			continue
 		}
 		externalLinks = append(externalLinks, u.Hostname())
-		if len(externalLinks) > 10000 {
+		if len(externalLinks) > 8000 {
 			for _, link := range RemoveDuplicates(externalLinks) {
 				domain = Domains{Domain: link, Checked: false}
 				db.FirstOrCreate(&domain, &domain)

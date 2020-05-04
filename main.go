@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/url"
 	"strings"
+	"sync"
 )
 
 type Domains struct {
@@ -55,11 +56,22 @@ func RemoveDuplicates(elements []string) []string {
 	return result
 }
 
-func Parser(targets <-chan string, external chan<- string) {
+func Worker(targets <-chan string, external chan<- string) {
+	var wg sync.WaitGroup
+	for target := range targets {
+		wg.Add(1)
+		go Parser(target, external, &wg)
+		wg.Wait()
+	}
+}
+
+func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
+	defer wg.Done()
 	c := colly.NewCollector(
 		colly.Async(true),
 		colly.MaxDepth(3),
 	)
+	c.Limit(&colly.LimitRule{Parallelism: 10})
 	extensions.RandomUserAgent(c)
 	extensions.Referer(c)
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
@@ -76,10 +88,8 @@ func Parser(targets <-chan string, external chan<- string) {
 		}
 
 	})
-	for target := range targets {
-		c.Visit(target)
-		c.Wait()
-	}
+	c.Visit(target)
+	c.Wait()
 }
 
 func StartParsing() {
@@ -96,8 +106,8 @@ func StartParsing() {
 	defer db.Close()
 	targets := make(chan string, 10000)
 	external := make(chan string, 10000)
-	for i := 0; i < 5; i++ {
-		go Parser(targets, external)
+	for i := 0; i < 10; i++ {
+		go Worker(targets, external)
 	}
 	if len(targets) < 100 {
 		db.Where("checked = ?", false).Limit(200).Find(&targetDomains)
@@ -121,7 +131,7 @@ func StartParsing() {
 			continue
 		}
 		externalLinks = append(externalLinks, u.Hostname())
-		if len(externalLinks) > 1000 {
+		if len(externalLinks) > 10000 {
 			for _, link := range RemoveDuplicates(externalLinks) {
 				domain = Domains{Domain: link, Checked: false}
 				db.FirstOrCreate(&domain, &domain)

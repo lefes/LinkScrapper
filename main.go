@@ -1,15 +1,23 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"github.com/gocolly/colly"
 	"github.com/gocolly/colly/extensions"
 	"github.com/jinzhu/gorm"
 	_ "github.com/jinzhu/gorm/dialects/sqlite"
+	"io/ioutil"
 	"log"
+	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
+
+// TODO Refactore all code
 
 type Domains struct {
 	gorm.Model
@@ -18,6 +26,7 @@ type Domains struct {
 }
 
 func CreateDB() {
+	// TODO check if table and db exists
 	db, err := gorm.Open("sqlite3", "domains.db")
 	if err != nil {
 		log.Println(err)
@@ -30,10 +39,6 @@ func CreateDB() {
 	db.AutoMigrate(&Domains{})
 	db.Create(&Domains{Domain: "google.com", Checked: false})
 	db.Create(&Domains{Domain: "yandex.ru", Checked: false})
-	//domain := Domains{Domain: "yandex.ru", Checked: false}
-	//db.FirstOrCreate(&domain, Domains{Domain: "non_existing"})
-	//domain = Domains{Domain: "qweqweqwe.ru", Checked: false}
-	//db.FirstOrCreate(&domain, &domain)
 
 }
 
@@ -68,10 +73,9 @@ func Worker(targets <-chan string, external chan<- string) {
 func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	c := colly.NewCollector(
-		//colly.Async(true),
 		colly.MaxDepth(3),
 	)
-	//c.Limit(&colly.LimitRule{Parallelism: 300})
+	// TODO Mb add limit parallelism
 	extensions.RandomUserAgent(c)
 	extensions.Referer(c)
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
@@ -92,9 +96,33 @@ func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 	//c.Wait()
 }
 
+func SendAlert(db *gorm.DB) {
+	var result int
+	t := time.Now()
+	n := time.Date(t.Year(), t.Month(), t.Day(), 6, 0, 0, 0, t.Location())
+	d := n.Sub(t)
+	if d < 0 {
+		n = n.Add(24 * time.Hour)
+		d = n.Sub(t)
+	}
+	for {
+		time.Sleep(d)
+		d = 24 * time.Hour
+		db.Table("domains").Count(&result)
+		jsonStr := []byte(`{ "token": "` + Token + `", "message": "Всего записей в DB: ` + strconv.Itoa(result) + `"}`)
+		urlReq := "http://192.168.88.215:9999/telegram"
+		resp, err := http.Post(urlReq, "application/json", bytes.NewBuffer(jsonStr))
+		if err != nil {
+			log.Println(err)
+		}
+		defer resp.Body.Close()
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		fmt.Println(string(bodyBytes))
+	}
+}
+
 func StartParsing() {
 	// TODO BULK INSERT AND OTHERS OPTIMIZATION
-	//var insertDomains []interface{}
 	var targetDomains []Domains
 	var domain Domains
 	var externalLinks []string
@@ -102,8 +130,10 @@ func StartParsing() {
 	if err != nil {
 		log.Println(err)
 	}
+	go SendAlert(db)
+	// TODO defer db.close()??
 	//db.LogMode(true)
-	defer db.Close()
+	//defer db.Close()
 	targets := make(chan string, 1000)
 	external := make(chan string, 10000)
 	for i := 0; i < 100; i++ {
@@ -142,6 +172,7 @@ func StartParsing() {
 }
 
 func main() {
+	// TODO add parse flags
 	CreateDB()
 	StartParsing()
 }

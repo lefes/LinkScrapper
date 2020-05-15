@@ -74,6 +74,7 @@ func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	c := colly.NewCollector(
 		colly.MaxDepth(3),
+		colly.MaxBodySize(31457280),
 	)
 	// TODO Mb add limit parallelism
 	extensions.RandomUserAgent(c)
@@ -87,6 +88,7 @@ func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 			} else if strings.HasPrefix(link, "/") && link[:2] != "//" {
 				e.Request.Visit(link)
 			} else {
+				// TODO check if url is valid
 				external <- link
 			}
 		}
@@ -122,7 +124,7 @@ func SendAlert(db *gorm.DB) {
 }
 
 func StartParsing() {
-	// TODO BULK INSERT AND OTHERS OPTIMIZATION
+	// TODO BULK INSERT AND OTHERS OPTIMIZATIONS
 	var targetDomains []Domains
 	var domain Domains
 	var externalLinks []string
@@ -143,6 +145,7 @@ func StartParsing() {
 		db.Where("checked = ?", false).Limit(200).Find(&targetDomains)
 		for _, domain := range targetDomains {
 			targets <- "http://" + domain.Domain + "/"
+			// TODO Update with select in one query
 			db.Model(&domain).Update("checked", true)
 		}
 		targetDomains = []Domains{}
@@ -164,6 +167,7 @@ func StartParsing() {
 		if len(externalLinks) > 8000 {
 			for _, link := range RemoveDuplicates(externalLinks) {
 				domain = Domains{Domain: link, Checked: false}
+				// TODO Add transaction to create
 				db.FirstOrCreate(&domain, &domain)
 			}
 			externalLinks = []string{}

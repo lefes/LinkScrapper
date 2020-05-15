@@ -2,15 +2,14 @@ package main
 
 import (
 	"bytes"
-	"fmt"
+	"database/sql"
 	"github.com/gocolly/colly"
 	"github.com/gocolly/colly/extensions"
-	"github.com/jinzhu/gorm"
-	_ "github.com/jinzhu/gorm/dialects/sqlite"
-	"io/ioutil"
+	_ "github.com/mattn/go-sqlite3"
 	"log"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,28 +17,32 @@ import (
 )
 
 // TODO Refactore all code
-
-type Domains struct {
-	gorm.Model
-	Domain  string `gorm:"not null; size:255; unique; index"`
-	Checked bool
-}
+// TODO сделать checked только после проверки, а также сохранение источника домена
 
 func CreateDB() {
 	// TODO check if table and db exists
-	db, err := gorm.Open("sqlite3", "domains.db")
+	db, err := sql.Open("sqlite3", "./new_domains.db")
 	if err != nil {
 		log.Println(err)
 	}
-	//db.LogMode(true)
-
 	defer db.Close()
-
-	// Migrate the schema
-	db.AutoMigrate(&Domains{})
-	db.Create(&Domains{Domain: "google.com", Checked: false})
-	db.Create(&Domains{Domain: "yandex.ru", Checked: false})
-
+	_, _ = db.Exec("CREATE TABLE IF NOT EXISTS `domains` (" +
+		"`id` INTEGER PRIMARY KEY AUTOINCREMENT," +
+		"`created` DATETIME DEFAULT CURRENT_TIMESTAMP," +
+		"`domain` VARCHAR(256) NULL UNIQUE," +
+		"`checked` BOOL DEFAULT FALSE" +
+		");")
+	ins, err := db.Prepare("INSERT OR IGNORE INTO domains(domain) values (?)")
+	if err != nil {
+		log.Println(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		log.Println(err)
+	}
+	_, _ = tx.Stmt(ins).Exec("yandex.ru")
+	_, _ = tx.Stmt(ins).Exec("google.com")
+	tx.Commit()
 }
 
 func RemoveDuplicates(elements []string) []string {
@@ -72,34 +75,41 @@ func Worker(targets <-chan string, external chan<- string) {
 
 func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
+	var re = regexp.MustCompile(`(?mi)^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$`)
 	c := colly.NewCollector(
 		colly.MaxDepth(3),
 		colly.MaxBodySize(31457280),
 	)
-	// TODO Mb add limit parallelism
 	extensions.RandomUserAgent(c)
 	extensions.Referer(c)
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
 		link := e.Attr("href")
 		if len(link) > 3 {
 			fullurl := e.Request.URL.Scheme + "://" + e.Request.URL.Host + "/"
-			if strings.HasPrefix(link, fullurl) || link[:1] == "#" {
+			if link[:1] == "#" {
+
+			} else if strings.HasPrefix(link, fullurl) {
 				e.Request.Visit(link)
 			} else if strings.HasPrefix(link, "/") && link[:2] != "//" {
 				e.Request.Visit(link)
 			} else {
-				// TODO check if url is valid
-				external <- link
+				u, err := url.Parse(link)
+				if err == nil {
+					if re.MatchString(u.Hostname()) && strings.Contains(u.Hostname(), ".") {
+						external <- u.Hostname()
+					}
+				}
 			}
 		}
 
 	})
 	c.Visit(target)
-	//c.Wait()
 }
 
-func SendAlert(db *gorm.DB) {
-	var result int
+func SendAlert(db *sql.DB) {
+	var count int
+	var countTrue int
+	var countFalse int
 	t := time.Now()
 	n := time.Date(t.Year(), t.Month(), t.Day(), 6, 0, 0, 0, t.Location())
 	d := n.Sub(t)
@@ -108,68 +118,108 @@ func SendAlert(db *gorm.DB) {
 		d = n.Sub(t)
 	}
 	for {
-		time.Sleep(d)
-		d = 24 * time.Hour
-		db.Table("domains").Count(&result)
-		jsonStr := []byte(`{ "token": "` + Token + `", "message": "Всего записей в DB: ` + strconv.Itoa(result) + `"}`)
+
+		rows, err := db.Query("select count(*) from domains")
+		for rows.Next() {
+			err = rows.Scan(&count)
+			if err != nil {
+				log.Println(err)
+			}
+		}
+		rows.Close()
+		rows, err = db.Query("select count(*) from domains where checked=TRUE")
+		for rows.Next() {
+			err = rows.Scan(&countTrue)
+			if err != nil {
+				log.Println(err)
+			}
+		}
+		rows.Close()
+		rows, err = db.Query("select count(*) from domains where checked=FALSE")
+		for rows.Next() {
+			err = rows.Scan(&countFalse)
+			if err != nil {
+				log.Println(err)
+			}
+		}
+		rows.Close()
+		jsonStr := []byte(`{ "token": "` + Token + `", "message": "Всего записей: ` + strconv.Itoa(count) + `\nПроверенных записей: ` + strconv.Itoa(countTrue) + `\nНе проверенных записей: ` + strconv.Itoa(countFalse) + `"}`)
 		urlReq := "http://192.168.88.215:9999/telegram"
 		resp, err := http.Post(urlReq, "application/json", bytes.NewBuffer(jsonStr))
 		if err != nil {
 			log.Println(err)
 		}
 		defer resp.Body.Close()
-		bodyBytes, _ := ioutil.ReadAll(resp.Body)
-		fmt.Println(string(bodyBytes))
+		time.Sleep(d)
+		d = 24 * time.Hour
 	}
 }
 
+func AddTargets(db *sql.DB, targets chan<- string) {
+	var domain string
+	var domains []string
+	upd, err := db.Prepare("update domains set checked=true where domain=?")
+	if err != nil {
+		log.Println(err)
+	}
+	rows, err := db.Query("select domain from domains where checked=false limit 300")
+	for rows.Next() {
+		err = rows.Scan(&domain)
+		if err != nil {
+			log.Println("SELECT DOMAINS", err)
+		} else {
+			targets <- "http://" + domain + "/"
+			domains = append(domains, domain)
+		}
+	}
+	rows.Close()
+	for _, domain := range domains {
+		_, err := upd.Exec(domain)
+		if err != nil {
+			log.Println("UPDATE DOMAINS", err)
+		}
+	}
+	domains = []string{}
+}
+
 func StartParsing() {
-	// TODO BULK INSERT AND OTHERS OPTIMIZATIONS
-	var targetDomains []Domains
-	var domain Domains
+	// TODO SQLITE and code optimisations
 	var externalLinks []string
-	db, err := gorm.Open("sqlite3", "domains.db")
+	db, err := sql.Open("sqlite3", "./new_domains.db")
 	if err != nil {
 		log.Println(err)
 	}
 	go SendAlert(db)
-	// TODO defer db.close()??
-	//db.LogMode(true)
-	//defer db.Close()
+	ins, err := db.Prepare("INSERT OR IGNORE INTO domains(domain) values (?)")
+	if err != nil {
+		log.Println("PREPARE INSERT", err)
+	}
+	defer db.Close()
 	targets := make(chan string, 1000)
 	external := make(chan string, 10000)
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 230; i++ {
 		go Worker(targets, external)
 	}
-	if len(targets) < 100 {
-		db.Where("checked = ?", false).Limit(200).Find(&targetDomains)
-		for _, domain := range targetDomains {
-			targets <- "http://" + domain.Domain + "/"
-			// TODO Update with select in one query
-			db.Model(&domain).Update("checked", true)
-		}
-		targetDomains = []Domains{}
-	}
+
+	AddTargets(db, targets)
 	for link := range external {
-		if len(targets) < 100 {
-			db.Where("checked = ?", false).Limit(200).Find(&targetDomains)
-			for _, domain := range targetDomains {
-				targets <- "http://" + domain.Domain + "/"
-				db.Model(&domain).Update("checked", true)
+		if len(targets) < 300 {
+			AddTargets(db, targets)
+		}
+
+		externalLinks = append(externalLinks, link)
+		if len(externalLinks) > 50 {
+			tx, err := db.Begin()
+			if err != nil {
+				log.Println("Transaction", err)
 			}
-			targetDomains = []Domains{}
-		}
-		u, err := url.Parse(link)
-		if err != nil {
-			continue
-		}
-		externalLinks = append(externalLinks, u.Hostname())
-		if len(externalLinks) > 8000 {
 			for _, link := range RemoveDuplicates(externalLinks) {
-				domain = Domains{Domain: link, Checked: false}
-				// TODO Add transaction to create
-				db.FirstOrCreate(&domain, &domain)
+				_, err = tx.Stmt(ins).Exec(link)
+				if err != nil {
+					log.Println("Inserting link", err)
+				}
 			}
+			tx.Commit()
 			externalLinks = []string{}
 		}
 	}
@@ -177,6 +227,6 @@ func StartParsing() {
 
 func main() {
 	// TODO add parse flags
-	CreateDB()
+	//CreateDB()
 	StartParsing()
 }

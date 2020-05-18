@@ -18,9 +18,10 @@ import (
 
 // TODO Refactore all code
 // TODO сделать checked только после проверки, а также сохранение источника домена
+// TODO разобрать что кушает память
+// TODO проверить строки и их рефлекторы, возможно из-за них утечка
 
 func CreateDB() {
-	// TODO check if table and db exists
 	db, err := sql.Open("sqlite3", "./new_domains.db")
 	if err != nil {
 		log.Println(err)
@@ -76,6 +77,7 @@ func Worker(targets <-chan string, external chan<- string) {
 func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	var re = regexp.MustCompile(`(?mi)^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$`)
+	var reExt = regexp.MustCompile(`(?m)\.[a-zA-A0-9]*$`)
 	c := colly.NewCollector(
 		colly.MaxDepth(3),
 		colly.MaxBodySize(31457280),
@@ -84,19 +86,23 @@ func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 	extensions.Referer(c)
 	c.OnHTML("a[href]", func(e *colly.HTMLElement) {
 		link := e.Attr("href")
-		if len(link) > 3 {
-			fullurl := e.Request.URL.Scheme + "://" + e.Request.URL.Host + "/"
-			if link[:1] == "#" {
-
-			} else if strings.HasPrefix(link, fullurl) {
-				e.Request.Visit(link)
-			} else if strings.HasPrefix(link, "/") && link[:2] != "//" {
-				e.Request.Visit(link)
-			} else {
-				u, err := url.Parse(link)
-				if err == nil {
-					if re.MatchString(u.Hostname()) && strings.Contains(u.Hostname(), ".") {
-						external <- u.Hostname()
+		ext := reExt.FindString(link)
+		_, err := FILE_EXTENSIONS[ext]
+		if !err || ext == "" {
+			if len(link) > 3 {
+				fullurl := e.Request.URL.Scheme + "://" + e.Request.URL.Host + "/"
+				if link[:1] == "#" {
+				} else if strings.HasPrefix(link, fullurl) {
+					//c.Visit(e.Request.AbsoluteURL(link))
+					e.Request.Visit(link)
+				} else if strings.HasPrefix(link, "/") && link[:2] != "//" {
+					e.Request.Visit(link)
+				} else {
+					u, err := url.Parse(link)
+					if err == nil {
+						if re.MatchString(u.Hostname()) && strings.Contains(u.Hostname(), ".") {
+							external <- u.Hostname()
+						}
 					}
 				}
 			}
@@ -197,7 +203,7 @@ func StartParsing() {
 	defer db.Close()
 	targets := make(chan string, 1000)
 	external := make(chan string, 10000)
-	for i := 0; i < 230; i++ {
+	for i := 0; i < 100; i++ {
 		go Worker(targets, external)
 	}
 
@@ -208,7 +214,7 @@ func StartParsing() {
 		}
 
 		externalLinks = append(externalLinks, link)
-		if len(externalLinks) > 50 {
+		if len(externalLinks) > 8000 {
 			tx, err := db.Begin()
 			if err != nil {
 				log.Println("Transaction", err)

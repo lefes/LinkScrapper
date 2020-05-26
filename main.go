@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"flag"
 	"github.com/gocolly/colly"
 	"github.com/gocolly/colly/extensions"
 	_ "github.com/mattn/go-sqlite3"
@@ -20,6 +21,7 @@ import (
 // TODO сделать checked только после проверки, а также сохранение источника домена
 // TODO разобрать что кушает память
 // TODO проверить строки и их рефлекторы, возможно из-за них утечка
+// TODO переделать, чтобы проверять ссылки по белому списку расширений
 
 func CreateDB() {
 	db, err := sql.Open("sqlite3", "./new_domains.db")
@@ -47,21 +49,15 @@ func CreateDB() {
 }
 
 func RemoveDuplicates(elements []string) []string {
-	// Use map to record duplicates as we find them.
 	encountered := map[string]bool{}
 	var result []string
-
 	for v := range elements {
 		if encountered[elements[v]] == true {
-			// Do not add duplicate.
 		} else {
-			// Record this element as an encountered element.
 			encountered[elements[v]] = true
-			// Append to result slice.
 			result = append(result, elements[v])
 		}
 	}
-	// Return the new slice.
 	return result
 }
 
@@ -101,7 +97,7 @@ func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 					u, err := url.Parse(link)
 					if err == nil {
 						if re.MatchString(u.Hostname()) && strings.Contains(u.Hostname(), ".") {
-							external <- u.Hostname()
+							external <- strings.ToLower(u.Hostname())
 						}
 					}
 				}
@@ -110,6 +106,14 @@ func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 
 	})
 	c.Visit(target)
+}
+
+func SendToTelegram(jsonStr []byte) {
+	urlReq := "http://192.168.88.215:9999/telegram"
+	_, err := http.Post(urlReq, "application/json", bytes.NewBuffer(jsonStr))
+	if err != nil {
+		log.Println(err)
+	}
 }
 
 func SendAlert(db *sql.DB) {
@@ -124,40 +128,19 @@ func SendAlert(db *sql.DB) {
 		d = n.Sub(t)
 	}
 	for {
-
-		rows, err := db.Query("select count(*) from domains")
-		for rows.Next() {
-			err = rows.Scan(&count)
-			if err != nil {
-				log.Println(err)
-			}
-		}
-		rows.Close()
-		rows, err = db.Query("select count(*) from domains where checked=TRUE")
-		for rows.Next() {
-			err = rows.Scan(&countTrue)
-			if err != nil {
-				log.Println(err)
-			}
-		}
-		rows.Close()
-		rows, err = db.Query("select count(*) from domains where checked=FALSE")
-		for rows.Next() {
-			err = rows.Scan(&countFalse)
-			if err != nil {
-				log.Println(err)
-			}
-		}
-		rows.Close()
-		jsonStr := []byte(`{ "token": "` + Token + `", "message": "Всего записей: ` + strconv.Itoa(count) + `\nПроверенных записей: ` + strconv.Itoa(countTrue) + `\nНе проверенных записей: ` + strconv.Itoa(countFalse) + `"}`)
-		urlReq := "http://192.168.88.215:9999/telegram"
-		resp, err := http.Post(urlReq, "application/json", bytes.NewBuffer(jsonStr))
+		time.Sleep(d)
+		d = 24 * time.Hour
+		rows, err := db.Query("select (select count(domain) from domains),(select count(domain) from domains where checked=FALSE), (select count(domain) from domains where checked=TRUE)")
 		if err != nil {
 			log.Println(err)
 		}
-		defer resp.Body.Close()
-		time.Sleep(d)
-		d = 24 * time.Hour
+		rows.Next()
+		err = rows.Scan(&count, &countFalse, &countTrue)
+		if err != nil {
+			log.Println(err)
+		}
+		rows.Close()
+		SendToTelegram([]byte(`{ "token": "` + Token + `", "message": "Всего записей: ` + strconv.Itoa(count) + `\nПроверенных записей: ` + strconv.Itoa(countTrue) + `\nНе проверенных записей: ` + strconv.Itoa(countFalse) + `"}`))
 	}
 }
 
@@ -189,7 +172,6 @@ func AddTargets(db *sql.DB, targets chan<- string) {
 }
 
 func StartParsing() {
-	// TODO SQLITE and code optimisations
 	var externalLinks []string
 	db, err := sql.Open("sqlite3", "./new_domains.db")
 	if err != nil {
@@ -206,13 +188,11 @@ func StartParsing() {
 	for i := 0; i < 100; i++ {
 		go Worker(targets, external)
 	}
-
 	AddTargets(db, targets)
 	for link := range external {
 		if len(targets) < 300 {
 			AddTargets(db, targets)
 		}
-
 		externalLinks = append(externalLinks, link)
 		if len(externalLinks) > 8000 {
 			tx, err := db.Begin()
@@ -232,7 +212,11 @@ func StartParsing() {
 }
 
 func main() {
-	// TODO add parse flags
-	//CreateDB()
+	var dbCreate bool
+	flag.BoolVar(&dbCreate, "db", false, "Create a new DB")
+	flag.Parse()
+	if dbCreate {
+		CreateDB()
+	}
 	StartParsing()
 }

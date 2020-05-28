@@ -45,7 +45,10 @@ func CreateDB() {
 	}
 	_, _ = tx.Stmt(ins).Exec("yandex.ru")
 	_, _ = tx.Stmt(ins).Exec("google.com")
-	tx.Commit()
+	err = tx.Commit()
+	if err != nil {
+		log.Println("Commit", err)
+	}
 }
 
 func RemoveDuplicates(elements []string) []string {
@@ -73,7 +76,7 @@ func Worker(targets <-chan string, external chan<- string) {
 func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	var re = regexp.MustCompile(`(?mi)^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$`)
-	var reExt = regexp.MustCompile(`(?m)\.[a-zA-A0-9]*$`)
+	var reExt = regexp.MustCompile(`(?m)\.[a-zA-Z0-9]*$`)
 	c := colly.NewCollector(
 		colly.MaxDepth(3),
 		colly.MaxBodySize(31457280),
@@ -89,10 +92,9 @@ func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 				fullurl := e.Request.URL.Scheme + "://" + e.Request.URL.Host + "/"
 				if link[:1] == "#" {
 				} else if strings.HasPrefix(link, fullurl) {
-					//c.Visit(e.Request.AbsoluteURL(link))
-					e.Request.Visit(link)
+					_ = e.Request.Visit(link)
 				} else if strings.HasPrefix(link, "/") && link[:2] != "//" {
-					e.Request.Visit(link)
+					_ = e.Request.Visit(link)
 				} else {
 					u, err := url.Parse(link)
 					if err == nil {
@@ -105,7 +107,7 @@ func Parser(target string, external chan<- string, wg *sync.WaitGroup) {
 		}
 
 	})
-	c.Visit(target)
+	_ = c.Visit(target)
 }
 
 func SendToTelegram(jsonStr []byte) {
@@ -139,7 +141,10 @@ func SendAlert(db *sql.DB) {
 		if err != nil {
 			log.Println(err)
 		}
-		rows.Close()
+		err = rows.Close()
+		if err != nil {
+			log.Println("Rows close", err)
+		}
 		SendToTelegram([]byte(`{ "token": "` + Token + `", "message": "Всего записей: ` + strconv.Itoa(count) + `\nПроверенных записей: ` + strconv.Itoa(countTrue) + `\nНе проверенных записей: ` + strconv.Itoa(countFalse) + `"}`))
 	}
 }
@@ -152,16 +157,21 @@ func AddTargets(db *sql.DB, targets chan<- string) {
 		log.Println(err)
 	}
 	rows, err := db.Query("select domain from domains where checked=false limit 300")
-	for rows.Next() {
-		err = rows.Scan(&domain)
+	if rows != nil {
+		for rows.Next() {
+			err = rows.Scan(&domain)
+			if err != nil {
+				log.Println("SELECT DOMAINS", err)
+			} else {
+				targets <- "http://" + domain + "/"
+				domains = append(domains, domain)
+			}
+		}
+		err = rows.Close()
 		if err != nil {
-			log.Println("SELECT DOMAINS", err)
-		} else {
-			targets <- "http://" + domain + "/"
-			domains = append(domains, domain)
+			log.Println(err)
 		}
 	}
-	rows.Close()
 	for _, domain := range domains {
 		_, err := upd.Exec(domain)
 		if err != nil {
@@ -185,7 +195,7 @@ func StartParsing() {
 	defer db.Close()
 	targets := make(chan string, 1000)
 	external := make(chan string, 10000)
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 150; i++ {
 		go Worker(targets, external)
 	}
 	AddTargets(db, targets)
@@ -205,7 +215,10 @@ func StartParsing() {
 					log.Println("Inserting link", err)
 				}
 			}
-			tx.Commit()
+			err = tx.Commit()
+			if err != nil {
+				log.Println("Commit", err)
+			}
 			externalLinks = []string{}
 		}
 	}
